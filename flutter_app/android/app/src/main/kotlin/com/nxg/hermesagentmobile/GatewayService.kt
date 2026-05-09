@@ -167,6 +167,11 @@ class GatewayService : Service() {
                 } catch (e: Exception) {
                     emitLog("[WARN] writeResolvConf failed: ${e.message}")
                 }
+                try {
+                    bootstrapManager.installEnvironmentFixes()
+                } catch (e: Exception) {
+                    emitLog("[WARN] installEnvironmentFixes failed: ${e.message}")
+                }
 
                 // Last-resort: verify resolv.conf exists, create inline if not
                 val resolvContent = "nameserver 8.8.8.8\nnameserver 8.8.4.4\n"

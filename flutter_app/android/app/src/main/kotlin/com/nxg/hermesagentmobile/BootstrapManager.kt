@@ -697,6 +697,28 @@ gateway:
                 }
             } catch (_: Exception) {}
         }
+
+        // Write .env defaults so the gateway's api_server platform auto-enables and
+        // binds to 127.0.0.1:18789. The platform auto-registers when API_SERVER_HOST
+        // and API_SERVER_PORT are set. GATEWAY_ALLOW_ALL_USERS=true allows access
+        // without a messaging platform allowlist configured.
+        val envFile = File(bypassDir, ".env")
+        val envDefaults = mapOf(
+            "GATEWAY_ALLOW_ALL_USERS" to "true",
+            "API_SERVER_HOST" to "127.0.0.1",
+            "API_SERVER_PORT" to "18789",
+        )
+        if (!envFile.exists()) {
+            envFile.writeText(envDefaults.entries.joinToString("\n") { "${it.key}=${it.value}" } + "\n")
+        } else {
+            try {
+                val text = envFile.readText()
+                val missing = envDefaults.filter { (k, _) -> !text.contains(k) }
+                if (missing.isNotEmpty()) {
+                    envFile.appendText("\n" + missing.entries.joinToString("\n") { "${it.key}=${it.value}" } + "\n")
+                }
+            } catch (_: Exception) {}
+        }
     }
 
     /**
