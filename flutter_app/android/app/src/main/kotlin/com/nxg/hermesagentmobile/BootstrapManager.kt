@@ -697,6 +697,21 @@ gateway:
                 }
             } catch (_: Exception) {}
         }
+
+        // Write .env defaults so the gateway starts without requiring full onboarding.
+        // GATEWAY_ALLOW_ALL_USERS=true keeps the HTTP server alive even with no
+        // messaging platforms configured — otherwise the gateway shuts down port 18789.
+        val envFile = File(bypassDir, ".env")
+        if (!envFile.exists()) {
+            envFile.writeText("GATEWAY_ALLOW_ALL_USERS=true\n")
+        } else {
+            try {
+                val text = envFile.readText()
+                if (!text.contains("GATEWAY_ALLOW_ALL_USERS")) {
+                    envFile.appendText("\nGATEWAY_ALLOW_ALL_USERS=true\n")
+                }
+            } catch (_: Exception) {}
+        }
     }
 
     /**
