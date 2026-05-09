@@ -698,17 +698,24 @@ gateway:
             } catch (_: Exception) {}
         }
 
-        // Write .env defaults so the gateway starts without requiring full onboarding.
-        // GATEWAY_ALLOW_ALL_USERS=true keeps the HTTP server alive even with no
-        // messaging platforms configured — otherwise the gateway shuts down port 18789.
+        // Write .env defaults so the gateway's api_server platform auto-enables and
+        // binds to 127.0.0.1:18789. The platform auto-registers when API_SERVER_HOST
+        // and API_SERVER_PORT are set. GATEWAY_ALLOW_ALL_USERS=true allows access
+        // without a messaging platform allowlist configured.
         val envFile = File(bypassDir, ".env")
+        val envDefaults = mapOf(
+            "GATEWAY_ALLOW_ALL_USERS" to "true",
+            "API_SERVER_HOST" to "127.0.0.1",
+            "API_SERVER_PORT" to "18789",
+        )
         if (!envFile.exists()) {
-            envFile.writeText("GATEWAY_ALLOW_ALL_USERS=true\n")
+            envFile.writeText(envDefaults.entries.joinToString("\n") { "${it.key}=${it.value}" } + "\n")
         } else {
             try {
                 val text = envFile.readText()
-                if (!text.contains("GATEWAY_ALLOW_ALL_USERS")) {
-                    envFile.appendText("\nGATEWAY_ALLOW_ALL_USERS=true\n")
+                val missing = envDefaults.filter { (k, _) -> !text.contains(k) }
+                if (missing.isNotEmpty()) {
+                    envFile.appendText("\n" + missing.entries.joinToString("\n") { "${it.key}=${it.value}" } + "\n")
                 }
             } catch (_: Exception) {}
         }
