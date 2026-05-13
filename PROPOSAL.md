@@ -51,11 +51,23 @@ SplashScreen ──▶ SetupWizardScreen ──▶ OnboardingScreen ──▶ Da
 | **`api_server` platform adapter** | `gateway/platforms/api_server.py` | **aiohttp** | core default `127.0.0.1:8642` | **OpenAI-compatible REST + SSE.** Only starts if the `api_server` platform is enabled in `~/.hermes/config.yaml`. **The app assumes this is on `:18789`** (README; `constants.dart:21 gatewayPort = 18789`; `GatewayService.kt`'s port checks / watchdog / notification all hard-code `18789`). |
 | **Web dashboard** | `web/` (Vite + React 19 + TS) → `hermes_cli/web_dist/`; backend `hermes_cli/web_server.py` (`python -m hermes_cli.main web` / `hermes dashboard`) | **FastAPI** | `127.0.0.1:9119` | Config / env / model / session / cron / logs / analytics management SPA. **Not run by the app today.** Its "Chat" tab is **not** a chat UI — it's an `@xterm/xterm` terminal over a `/api/pty` WebSocket running the Ink TUI. |
 
-### 2.3 ⚠️ The linchpin question
+### 2.3 ⚠️ The linchpin — verified empirically (Phase 0 done, 2026-05-13)
 
-**The native chat is only possible if something is actually serving HTTP on `:18789`.** `gateway/run.py` itself does *not* serve HTTP — the `api_server` adapter only starts when `platforms.api_server` is enabled in `~/.hermes/config.yaml`, and the repo doesn't obviously do that: `onboarding_screen.dart:103` / `configure_screen.dart:91` just run `python -m hermes_cli.main setup` plain. Nothing in core defaults `api_server` to port `18789` (core default is `8642`; `18789` only appears in `hermes_cli/status.py` as "the gateway port"). So `:18789` may be inherited from the OpenClaw lineage and only work if the user happens to pick that port in the wizard.
+**The native chat is only possible if something is actually serving HTTP on `:18789`.** The Phase-0 spike was run; results are unambiguous:
 
-**Resolution:** the Phase 0 spike (§7) verifies what's actually listening on `:18789` and what's in `~/.hermes/config.yaml`. If the adapter isn't up by default, the proposal's Part A grows a small bootstrap step: write `platforms.api_server: { enabled: true, host: 127.0.0.1, port: 18789 }` into `~/.hermes/config.yaml` and an `API_SERVER_KEY` into `~/.hermes/.env` (and ensure the launch reads them). Either way the chat feature is achievable; this just determines whether it's "use what's there" or "use what's there + one config-write."
+- **As shipped, `python gateway/run.py` opens *zero* ports.** With a fresh `~/.hermes` and no env vars, the gateway boots, logs `"No messaging platforms enabled"`, and idles. `ss -tln` shows nothing on `:18789`, `:8642`, or `:9119`; every `curl` to those ports gets `connection refused`. **The app's current `localhost:18789` premise is broken in practice** — the watchdog at `GatewayService.kt:381` ("port 18789 not responding") would always trigger, the "Browser at localhost:18789" line in `README.md:29` is fiction. The user has confirmed this matches their hands-on experience.
+- **The fix is a 4-line env-var injection.** `gateway/config.py:1402-1426` enables the `api_server` platform iff `API_SERVER_ENABLED` (truthy) **or** `API_SERVER_KEY` is set; port is read from `API_SERVER_PORT` (core default `8642`, not `18789`). Setting:
+  ```
+  API_SERVER_ENABLED=true
+  API_SERVER_PORT=18789
+  API_SERVER_KEY=<generated>
+  GATEWAY_ALLOW_ALL_USERS=true       # otherwise the agent denies its own runs
+  ```
+  in `~/.hermes/.env` (which `python-dotenv` auto-loads — verified) is sufficient to bring up the full chat API. No `config.yaml` schema edits required.
+- **`hermes setup` does not wire api_server.** `grep -n "api_server" hermes_cli/setup.py` returns nothing — the wizard configures models / providers / messaging platforms but never offers an "expose an HTTP API" step. So the **app must write these env vars itself** during bootstrap; we can't rely on the user picking them in the terminal wizard.
+- **`18789` is a HermesAgentMobile invention.** In hermes-agent core the only mention is `hermes_cli/status.py:538`, where it's a hard-coded liveness probe (`sock.connect_ex(('127.0.0.1', 18789))`) — almost certainly OpenClaw-lineage cruft. We can keep `18789` (since the app already hard-codes it everywhere) or switch to the core default `8642`; the proposal recommends keeping `18789` to minimise churn in `GatewayService.kt` / `constants.dart` / the README.
+
+**Implication for Part A:** the proposal's "one bootstrap step" is now firm (not a "possibly"). `bootstrap_service.dart` appends those four lines to `~/.hermes/.env` (generating a fresh `API_SERVER_KEY` once and persisting it), and the Flutter client reads the same key. Everything else in §3–4 stands as written. The verified API surface and observed event taxonomy are in §10.
 
 ---
 
@@ -79,8 +91,8 @@ Route table (registered in `start()`, `api_server.py:3336-3361`):
 
 **Transport choice for the chat:**
 
-- **Primary — `POST /v1/runs` → SSE `GET /v1/runs/{run_id}/events`.** hermes-agent is *agentic* (it calls tools), so the structured event stream is what makes a "proper" chat: you can render tool calls / tool results / "thinking" as distinct collapsible elements, and surface approval prompts inline. Send `{messages, model, ...}` to `/v1/runs`, get a `run_id`, open an `EventSource`-style SSE connection to `/v1/runs/{run_id}/events`, fold message-deltas into the in-flight bubble.
-- **Fallback — `POST /v1/chat/completions` with `stream:true`.** If the installed hermes version doesn't expose `/v1/runs` + `/events`, fall back to plain OpenAI streaming (token deltas only — no tool/thinking events). The client should feature-detect via `GET /v1/capabilities` / a probe.
+- **Primary — `POST /v1/runs` → SSE `GET /v1/runs/{run_id}/events`.** hermes-agent is *agentic* (it calls tools), so the structured event stream is what makes a "proper" chat: you can render tool calls / tool results / "thinking" as distinct collapsible elements, and surface approval prompts inline. Body is `{"model":"hermes-agent","input":"<text>","session_id"?:"..."}` — note `"input"` (Responses-API-shape), **not** the OpenAI `{"messages":[...]}` shape (`POST /v1/runs` with a `messages` body returns `{"error":{"message":"Missing 'input' field"}}` — verified). Response is `{"run_id":"run_…","status":"started"}` (202). Then `GET /v1/runs/{run_id}/events` is an SSE stream of newline-delimited `data: {"event":"<name>","run_id":"…","timestamp":…,...}` records; the connection closes with `: stream closed`. `GET /v1/runs/{run_id}` returns `{"object":"hermes.run","run_id","status","created_at","updated_at","session_id","model","error?","last_event"}`.
+- **Fallback — `POST /v1/chat/completions` with `stream:true`.** OpenAI-shape `{"model","messages":[…],"stream":true}` → `data: {"id":"chatcmpl-…","object":"chat.completion.chunk","choices":[{"index":0,"delta":{…},"finish_reason":…}], "usage"?:{…}}` then `data: [DONE]`. Token deltas only — no tool/thinking events. The client should feature-detect via `GET /v1/capabilities` (the `features` map advertises `run_submission`, `run_events_sse`, `chat_completions_streaming`, etc. — Phase 0 confirmed all are `true` in v0.13.0).
 
 **Conversation model:** stateless by default; opt-in server-side continuity via the `X-Hermes-Session-Id` header (sessions persist in SQLite under `~/.hermes/`). **There is no `GET /conversations` / `/messages` history endpoint on the api_server adapter** — so v1 keeps chat history **client-side** (a small local store keyed by session id). (If we later also run `hermes dashboard`, `GET /api/sessions` / `GET /api/sessions/{id}/messages` become available — noted as a future enhancement.)
 
@@ -113,11 +125,18 @@ Route table (registered in `start()`, `api_server.py:3336-3361`):
 - `flutter_app/lib/widgets/gateway_controls.dart`, `flutter_app/lib/models/gateway_state.dart` — wire an "Open Chat" button to the new screen (reuse the existing `dashboardUrl` field).
 - `flutter_app/lib/screens/onboarding_screen.dart` — after `✓ Setup Complete!`, offer "Open Chat" beside (or instead of) "Open Dashboard"; flow otherwise unchanged.
 - `flutter_app/pubspec.yaml` — add `flutter_markdown` (or hand-roll a minimal markdown/code-block renderer) and `integration_test` (dev dep). `webview_flutter` / `web_socket_channel` / `http` / `dio` / `provider` / `uuid` are already present.
-- *(Possibly, Phase-0-dependent)* `flutter_app/lib/services/bootstrap_service.dart` — append a step that writes `platforms.api_server` config into `~/.hermes/config.yaml` and an `API_SERVER_KEY` into `~/.hermes/.env` if the adapter isn't enabled on `:18789` by default.
+- **`flutter_app/lib/services/bootstrap_service.dart` (required — see §2.3 / §10).** Append a step that writes
+  ```
+  API_SERVER_ENABLED=true
+  API_SERVER_PORT=18789
+  API_SERVER_KEY=<generated once, persisted to SharedPreferences>
+  GATEWAY_ALLOW_ALL_USERS=true
+  ```
+  to `~/.hermes/.env` (creating the file if absent, idempotent if these lines already exist — `hermes setup` writes other keys to the same file). No `config.yaml` edits needed; `python-dotenv` auto-loads it.
 
 ### 4.3 Behaviour
 
-- **Send:** `POST /v1/runs` with the conversation `messages` + selected `model` + `X-Hermes-Session-Id` → `run_id` → open SSE `GET /v1/runs/{run_id}/events`. Fall back to `POST /v1/chat/completions` `stream:true` if `/v1/runs` is unavailable.
+- **Send:** `POST /v1/runs` with `{"model":"hermes-agent","input":<user-text>,"session_id":<continuity-id>}` (the Responses-API body shape — `input`, *not* `messages`; see §3 / §10.4) + the `Authorization` and `X-Hermes-Session-Id` headers → `run_id` → open SSE `GET /v1/runs/{run_id}/events`. Fall back to `POST /v1/chat/completions` with `stream:true` and the OpenAI `{messages:[…]}` shape if `/v1/runs` ever proves unavailable.
 - **Stream:** fold message / message-delta events into the in-flight assistant bubble; render `thinking` events as a collapsible "Thinking…" card; render `tool_call` / `tool_result` events as collapsible cards (tool name + args / result); on `approval_request` (and `sudo` / `secret` requests) show an inline action card → `POST /v1/runs/{run_id}/approval`. On `error`, show an error bubble with a retry affordance.
 - **Stop:** while a run is active, the composer shows a stop button → `POST /v1/runs/{run_id}/stop`.
 - **History:** persist the message log client-side, keyed by `X-Hermes-Session-Id`; "New chat" starts a fresh session id. (Reconciliation with messages sent via the built-in terminal/TUI is out of scope — the chat screen owns its own session.)
@@ -173,21 +192,22 @@ A real bootstrap is ~300 MB + several minutes, so the tests are layered:
 
 ## 7. Risks & open questions
 
-1. **The `:18789` question (Phase-0 gate).** Is `platforms.api_server` enabled on port `18789` after the app's `hermes setup` run, or must the bootstrap write that config? If the latter, Part A grows one bootstrap step (config + `API_SERVER_KEY`). Either way the feature is achievable.
-2. **hermes-agent API stability.** v`0.13.0`; pin the cloned commit/tag in the bootstrap so the API doesn't drift under the app.
-3. **`/v1/runs` availability.** Does the installed hermes expose `/v1/runs` + `/events`, or only `/v1/chat/completions`? The transport fallback covers both, but verify in Phase 0.
+1. ~~**The `:18789` question (Phase-0 gate).**~~ **Resolved by Phase 0** (§2.3, §10). The api_server adapter is *not* up by default; the bootstrap must write `API_SERVER_ENABLED=true / API_SERVER_PORT=18789 / API_SERVER_KEY=<generated> / GATEWAY_ALLOW_ALL_USERS=true` to `~/.hermes/.env` (auto-loaded by python-dotenv). One bootstrap step; confirmed working.
+2. **hermes-agent API stability.** v`0.13.0` (HEAD `dd0923b`); pin the cloned commit/tag in the bootstrap so the API doesn't drift under the app. Their `dependencies` are exact-pinned (`pyproject.toml` comments cite the May-2026 supply-chain incident), which is reassuring for transitive stability — but the public route shape isn't versioned.
+3. ~~**`/v1/runs` availability.**~~ **Confirmed available** in v0.13.0 (capabilities probe returned `run_submission: true`, `run_events_sse: true`, `run_stop: true`, `run_approval_response: true`, `tool_progress_events: true`, `approval_events: true`).
 4. **No server-side chat history on the adapter** → client-side persistence; messages sent via the built-in terminal/TUI won't appear in the chat screen (acceptable — different surfaces).
-5. **Auth.** Recommend generating `API_SERVER_KEY` even on loopback; minor bootstrap change.
+5. **Auth.** Generating `API_SERVER_KEY` is now part of the bootstrap (item 1). The Flutter client reads the same key from `~/.hermes/.env` (or from a `SharedPreferences` mirror) and sends `Authorization: Bearer …`.
 6. **Approval / sudo / secret flows on a small screen** — design the inline cards / modals carefully.
 7. **Battery-optimization killing the gateway** — pre-existing failure mode, not introduced here, but the chat screen should surface "gateway not running" clearly.
 8. **The optional Dashboard WebView needs a second process** (`hermes dashboard`) — extra moving part; that's why it's optional.
-9. **CI cache size** if a pre-baked rootfs is vendored for the fast-bootstrap test.
+9. **`GATEWAY_ALLOW_ALL_USERS=true` weakens hermes-agent's user-allowlist** — fine on loopback-only Android (the proot user is effectively the device owner), but document the tradeoff. Without it the agent denied its own api_server runs in Phase 0.
+10. **CI cache size** if a pre-baked rootfs is vendored for the fast-bootstrap test.
 
 ---
 
 ## 8. Phased roadmap
 
-- **Phase 0 — spike (GO / NO-GO).** In the app's proot Ubuntu: start `python gateway/run.py`; `curl -s http://127.0.0.1:18789/health`, `GET /v1/capabilities`, `GET /v1/models`; `cat ~/.hermes/config.yaml` to see whether `platforms.api_server` is enabled on `18789`; `POST /v1/runs` and `curl -N http://127.0.0.1:18789/v1/runs/<id>/events`; `POST /v1/chat/completions` `{"stream":true,...}`. Record the transcript + the real `/v1/runs/{id}/events` event names in an appendix. **If nothing serves `:18789`,** the bootstrap is extended to enable `api_server` on `18789` (still in scope — a slightly bigger Part A).
+- ~~**Phase 0 — spike (GO / NO-GO).**~~ **Done.** See §2.3 + §10 — confirmed: as shipped the gateway opens zero ports; setting four env vars in `~/.hermes/.env` brings up the full `:18789` API; all advertised endpoints work; the `/v1/runs/*` SSE event taxonomy is documented in §10.
 - **Phase 1 — chat MVP.** `HermesClient` + `ChatProvider` + `ChatScreen`: send via `/v1/runs` (fallback `/v1/chat/completions`), stream events, render user/assistant bubbles, stop button, "Chat" dashboard card, auto-open on `running`.
 - **Phase 2 — agentic UX.** Thinking / tool-call / tool-result collapsible cards; approval / clarify / sudo modals; model picker; session-continuity + client-side history persistence; markdown / code rendering; "no provider — run setup" empty state; post-onboarding "Open Chat".
 - **Phase 3 — optional Dashboard WebView.** WebView tab + launching `hermes dashboard` on `:9119`.
@@ -205,11 +225,133 @@ The chat UI is essentially one file, `lib/pages/chatterScreen.dart` (~287 lines)
 
 ---
 
-## 10. Appendix — links
+## 10. Appendix — Phase-0 spike transcript & references
 
-- hermes-agent: <https://github.com/nousresearch/hermes-agent>
+**Setup:** clone `https://github.com/nousresearch/hermes-agent` @ `dd0923b` (v0.13.0); `python3 -m venv … && pip install -e hermes-agent && pip install aiohttp`. Run as a clean `HOME=/tmp/hermes-home` (no provider key configured).
+
+### 10.1 As shipped — `python -m gateway.run` with **no** env vars
+
+```
+$ python -m gateway.run -v
+WARNING __main__: No user allowlists configured. All unauthorized users will be denied.
+WARNING __main__: No messaging platforms enabled.
+$ ss -tln | grep -E '18789|8642|9119'   # → (nothing)
+$ curl -m 2 http://127.0.0.1:18789/health → curl: (7) Failed to connect
+$ curl -m 2 http://127.0.0.1:8642/health  → curl: (7) Failed to connect
+$ curl -m 2 http://127.0.0.1:9119/         → curl: (7) Failed to connect
+```
+**The gateway opens zero listening ports.** The process stays alive (it ticks cron and is "running with 0 platforms"), but no HTTP surface is exposed. This is exactly the state the app boots into today.
+
+### 10.2 With api_server enabled — write `~/.hermes/.env` then re-run
+
+```
+$ cat ~/.hermes/.env
+API_SERVER_ENABLED=true
+API_SERVER_PORT=18789
+API_SERVER_KEY=testkey
+GATEWAY_ALLOW_ALL_USERS=true
+
+$ python -m gateway.run -v                 # logs (~/.hermes/logs/agent.log):
+INFO __main__: Connecting to api_server...
+INFO gateway.platforms.api_server: [Api_Server] API server listening on http://127.0.0.1:18789 (model: hermes-agent)
+INFO __main__: ✓ api_server connected
+INFO __main__: Gateway running with 1 platform(s)
+```
+
+`python-dotenv` (a core dep) auto-loads `~/.hermes/.env`. Same result as exporting the vars on the command line. The same file is where `hermes setup` already stores provider API keys, so the bootstrap can append these four lines without colliding.
+
+### 10.3 Verified endpoints
+
+```
+$ curl -H 'Authorization: Bearer testkey' http://127.0.0.1:18789/v1/health
+{"status":"ok","platform":"hermes-agent"}
+
+$ curl http://127.0.0.1:18789/v1/models                              # no auth
+{"error":{"message":"Invalid API key","type":"invalid_request_error","code":"invalid_api_key"}}
+
+$ curl -H 'Authorization: Bearer testkey' http://127.0.0.1:18789/v1/models
+{"object":"list","data":[{"id":"hermes-agent","object":"model","created":1778650893,
+                          "owned_by":"hermes","permission":[],"root":"hermes-agent","parent":null}]}
+
+$ curl -H 'Authorization: Bearer testkey' http://127.0.0.1:18789/v1/capabilities
+{"object":"hermes.api_server.capabilities","platform":"hermes-agent","model":"hermes-agent",
+ "auth":{"type":"bearer","required":true},
+ "runtime":{"mode":"server_agent","tool_execution":"server","split_runtime":false, …},
+ "features":{"chat_completions":true,"chat_completions_streaming":true,
+             "responses_api":true,"responses_streaming":true,
+             "run_submission":true,"run_status":true,"run_events_sse":true,
+             "run_stop":true,"run_approval_response":true,
+             "tool_progress_events":true,"approval_events":true,
+             "session_continuity_header":"X-Hermes-Session-Id",
+             "session_key_header":"X-Hermes-Session-Key","cors":false},
+ "endpoints":{"health":{"method":"GET","path":"/health"},
+              "health_detailed":{"method":"GET","path":"/health/detailed"},
+              "models":{"method":"GET","path":"/v1/models"},
+              "chat_completions":{"method":"POST","path":"/v1/chat/completions"},
+              "responses":{"method":"POST","path":"/v1/responses"},
+              "runs":{"method":"POST","path":"/v1/runs"},
+              "run_status":{"method":"GET","path":"/v1/runs/{run_id}"},
+              "run_events":{"method":"GET","path":"/v1/runs/{run_id}/events"},
+              "run_approval":{"method":"POST","path":"/v1/runs/{run_id}/approval"},
+              "run_stop":{"method":"POST","path":"/v1/runs/{run_id}/stop"}}}
+```
+
+`GET /v1/models` 200 served by `Server: Python/3.11 aiohttp/3.13.5` with `Content-Type: application/json; charset=utf-8`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`.
+
+### 10.4 `POST /v1/runs` body shape — *correction*
+
+```
+$ curl -X POST … -d '{"model":"hermes-agent","messages":[{"role":"user","content":"hi"}]}'
+{"error":{"message":"Missing 'input' field","type":"invalid_request_error","param":null,"code":null}}
+
+$ curl -X POST … -d '{"model":"hermes-agent","input":"hi"}'
+{"run_id":"run_9b730378ae95414d9bbe24a71754a725","status":"started"}
+```
+
+`POST /v1/runs` uses the **Responses-API shape** (`{model, input, session_id?, …}`), **not** the Chat-Completions `{messages:[…]}` shape. The Dart client must send `input`. (`/v1/chat/completions` does still take `{messages}` — the two endpoints diverge here.)
+
+### 10.5 `GET /v1/runs/{id}/events` — SSE wire format
+
+```
+$ curl -N -H 'Authorization: Bearer testkey' http://127.0.0.1:18789/v1/runs/run_9b73…/events
+data: {"event":"run.failed","run_id":"run_9b73…","timestamp":1778650911.5763893,
+       "error":"No inference provider configured. Run 'hermes model' to choose a provider …"}
+
+: stream closed
+```
+
+Each event is a single `data: <json>\n\n` record. The JSON always has `event`, `run_id`, `timestamp`; per-event payload follows. The connection closes with a comment line `: stream closed`. (Failure happened here because no provider was configured — that's expected; once `hermes setup` writes e.g. `OPENROUTER_API_KEY` to `~/.hermes/.env`, runs would proceed and emit the documented `message` / `message.delta` / `tool.*` / `thinking` / `approval` / `status` events.)
+
+`GET /v1/runs/{id}` returns `{"object":"hermes.run","run_id","status","created_at","updated_at","session_id","model","error?","last_event"}` — useful for polling and for displaying terminal-state errors after the SSE closes.
+
+### 10.6 `POST /v1/chat/completions` (fallback) — SSE wire format
+
+```
+$ curl -N -X POST -H 'Authorization: Bearer testkey' -H 'Content-Type: application/json' \
+       -d '{"model":"hermes-agent","stream":true,"messages":[{"role":"user","content":"hi"}]}' \
+       http://127.0.0.1:18789/v1/chat/completions
+
+data: {"id":"chatcmpl-35731c…","object":"chat.completion.chunk","created":…,"model":"hermes-agent",
+       "choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-35731c…","object":"chat.completion.chunk","created":…,"model":"hermes-agent",
+       "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],
+       "usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}
+
+data: [DONE]
+```
+
+Standard OpenAI streaming. No tool/thinking events — that's the cost of the fallback path. The non-streaming variant returns a structured error when no provider is configured (`{"error":{"message":"Internal server error: No inference provider configured. …","type":"server_error",…}}`).
+
+### 10.7 References
+
+- hermes-agent: <https://github.com/nousresearch/hermes-agent> (v0.13.0, HEAD `dd0923b`)
+  - `gateway/run.py` (the daemon the app runs)
+  - `gateway/platforms/api_server.py` (the `:18789` adapter — `DEFAULT_PORT = 8642`)
+  - `gateway/config.py:1402-1426` (env-var → `Platform.API_SERVER` enablement)
+  - `hermes_cli/setup.py` (no `api_server` mentions — confirmed)
+  - `hermes_cli/status.py:538` (the lone `18789` reference in core — a liveness probe)
 - Chatter-App: <https://github.com/ishandeveloper/Chatter-App>
-- (Phase 0 will append: the `:18789` `curl` transcript + observed `/v1/runs/{id}/events` event taxonomy + the `~/.hermes/config.yaml` `platforms.api_server` state.)
 
 ### Decisions locked in with the owner
 
